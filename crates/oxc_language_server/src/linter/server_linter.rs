@@ -3,9 +3,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use ignore::gitignore::Gitignore;
-use log::{debug, warn};
-use oxc_linter::{AllowWarnDeny, LintIgnoreMatcher};
+use log::{debug, info, warn};
+use oxc_linter::{AllowWarnDeny, FixKind, LintIgnoreMatcher};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tower_lsp_server::lsp_types::{Diagnostic, Pattern, Uri};
 
@@ -34,13 +35,17 @@ pub enum ServerLinterRun {
 }
 
 pub struct ServerLinter {
-    isolated_linter: Arc<Mutex<IsolatedLintHandler>>,
-    tsgo_linter: Arc<Option<TsgoLinter>>,
+    pub(crate) isolated_linter: Arc<Mutex<IsolatedLintHandler>>,
+    pub(crate) tsgo_linter: Arc<Option<TsgoLinter>>,
     ignore_matcher: LintIgnoreMatcher,
     gitignore_glob: Vec<Gitignore>,
     lint_on_run: Run,
     diagnostics: ServerLinterDiagnostics,
     extended_paths: FxHashSet<PathBuf>,
+    // When true (workspace_mode enabled), type-aware (tsgo) linting is performed only in batch
+    // via WorkspaceWorker::lint_workspace. Per-file tsgo invocations are suppressed to avoid
+    // repeated process startup and improve performance on large projects.
+    workspace_mode: bool,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +91,78 @@ impl ServerLinterDiagnostics {
 }
 
 impl ServerLinter {
+    /// Batch lint a set of URIs, merging isolated (oxlint) and type-aware (tsgo) diagnostics when applicable.
+    /// Caller must provide URIs already filtered for ignore patterns if desired; this method re-checks ignores.
+    pub async fn lint_workspace_batch(&self, uris: &[Uri]) -> Vec<(String, Vec<Diagnostic>)> {
+        // Early exit if nothing to process or no isolated linter.
+        if uris.is_empty() {
+            return Vec::new();
+        }
+
+        // Filter out ignored again for safety (cheap).
+        let filtered: Vec<Uri> = uris.iter().filter(|u| !self.is_ignored(u)).cloned().collect();
+        if filtered.is_empty() {
+            return Vec::new();
+        }
+
+        let type_aware_active = self.tsgo_linter.as_ref().is_some();
+        use std::collections::HashMap;
+        let t_overall = Instant::now();
+
+        // Always run isolated batch first (includes JS + TS non-type-aware rules).
+        let isolated_paths: Vec<PathBuf> = filtered
+            .iter()
+            .filter_map(|u| u.to_file_path().map(|p| p.into_owned()))
+            .collect();
+        let t_isolated = Instant::now();
+        let isolated_batch = self.run_workspace_isolated(&isolated_paths).await;
+        debug!(
+            "[profile] batch isolated files={} ms={}",
+            isolated_batch.len(),
+            t_isolated.elapsed().as_millis()
+        );
+
+        let mut merged: HashMap<String, Vec<Diagnostic>> = HashMap::with_capacity(isolated_batch.len());
+        for (uri, reports) in isolated_batch.into_iter() {
+            self.cache_isolated_diagnostics(&uri, Some(reports.clone()));
+            let key = uri.to_string();
+            merged.entry(key).or_default().extend(reports.into_iter().map(|r| r.diagnostic));
+        }
+
+        // Run tsgo batch only if active.
+        if type_aware_active {
+            if let Some(tsgo) = self.tsgo_linter.as_ref() {
+                let t_tsgo = Instant::now();
+                let tsgo_batch = tsgo.lint_batch(&filtered);
+                info!("[tsgo] batch done produced={} ms={}", tsgo_batch.len(), t_tsgo.elapsed().as_millis());
+                debug!(
+                    "[profile] tsgo batch eligible={} produced={} ms={}",
+                    filtered.len(),
+                    tsgo_batch.len(),
+                    t_tsgo.elapsed().as_millis()
+                );
+                for (uri, reports) in tsgo_batch.into_iter() {
+                    self.cache_tsgo_diagnostics(&uri, Some(reports.clone()));
+                    let key = uri.to_string();
+                    merged.entry(key).or_default().extend(reports.into_iter().map(|r| r.diagnostic));
+                }
+            }
+        }
+
+        let mut out: Vec<(String, Vec<Diagnostic>)> = merged
+            .into_iter()
+            .map(|(uri, mut diags)| {
+                diags.sort_by(|a, b| {
+                    (a.range.start.line, a.range.start.character, a.range.end.line, a.range.end.character)
+                        .cmp(&(b.range.start.line, b.range.start.character, b.range.end.line, b.range.end.character))
+                });
+                (uri, diags)
+            })
+            .collect();
+        out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        debug!("[profile] batch total files={} ms={}", out.len(), t_overall.elapsed().as_millis());
+        out
+    }
     pub fn new(root_uri: &Uri, options: &LSPLintOptions) -> Self {
         let root_path = root_uri.to_file_path().unwrap();
         let mut nested_ignore_patterns = Vec::new();
@@ -117,6 +194,7 @@ impl ServerLinter {
 
         // TODO(refactor): pull this into a shared function, because in oxlint we have the same functionality.
         let use_nested_config = options.use_nested_configs();
+        let fix_kind = FixKind::from(options.fix_kind.clone());
 
         let use_cross_module = config_builder.plugins().has_import()
             || (use_nested_config
@@ -129,7 +207,7 @@ impl ServerLinter {
         });
 
         let lint_options = LintOptions {
-            fix: options.fix_kind(),
+            fix: fix_kind,
             report_unused_directive: match options.unused_disable_directives {
                 UnusedDisableDirectives::Allow => None, // or AllowWarnDeny::Allow, should be the same?
                 UnusedDisableDirectives::Warn => Some(AllowWarnDeny::Warn),
@@ -164,7 +242,7 @@ impl ServerLinter {
             },
         );
 
-        Self {
+        let instance = Self {
             isolated_linter: Arc::new(Mutex::new(isolated_linter)),
             ignore_matcher: LintIgnoreMatcher::new(
                 &base_patterns,
@@ -180,7 +258,16 @@ impl ServerLinter {
             } else {
                 Arc::new(None)
             },
-        }
+            workspace_mode: options.workspace_mode,
+        };
+        info!(
+            "[linter] init root={} workspace_mode={} type_aware={} run_mode={:?}",
+            root_path.display(),
+            instance.workspace_mode,
+            options.type_aware,
+            options.run
+        );
+        instance
     }
 
     /// Searches inside root_uri recursively for the default oxlint config files
@@ -284,27 +371,26 @@ impl ServerLinter {
     }
 
     pub async fn revalidate_diagnostics(&self, uris: Vec<Uri>) -> Vec<(String, Vec<Diagnostic>)> {
+        // Use batch path when workspace_mode is enabled (regardless of type-aware), else fallback to sequential.
+        if self.workspace_mode {
+            return self.lint_workspace_batch(&uris).await;
+        }
         let mut diagnostics = Vec::with_capacity(uris.len());
         for uri in uris {
-            if let Some(file_diagnostic) =
-                self.run_single(&uri, None, ServerLinterRun::Always).await
-            {
-                diagnostics.push((
-                    uri.to_string(),
-                    file_diagnostic.into_iter().map(|d| d.diagnostic).collect(),
-                ));
+            if let Some(file_diagnostic) = self.run_single(&uri, None, ServerLinterRun::Always).await {
+                diagnostics.push((uri.to_string(), file_diagnostic.into_iter().map(|d| d.diagnostic).collect()));
             }
         }
         diagnostics
     }
 
-    fn is_ignored(&self, uri: &Uri) -> bool {
+    pub fn is_ignored(&self, uri: &Uri) -> bool {
         let Some(uri_path) = uri.to_file_path() else {
             return true;
         };
 
         if self.ignore_matcher.should_ignore(&uri_path) {
-            debug!("ignored: {uri:?}");
+            debug!("ignored: {uri_path:?}");
             return true;
         }
 
@@ -313,7 +399,7 @@ impl ServerLinter {
                 continue;
             }
             if gitignore.matched_path_or_any_parents(&uri_path, uri_path.is_dir()).is_ignore() {
-                debug!("ignored: {uri:?}");
+                debug!("ignored: {uri_path:?}");
                 return true;
             }
         }
@@ -352,31 +438,87 @@ impl ServerLinter {
         }
 
         if oxlint {
-            let diagnostics = {
-                let mut isolated_linter = self.isolated_linter.lock().await;
-                isolated_linter.run_single(uri, content.clone())
-            };
+            let t0 = Some(Instant::now());
+            let mut isolated_linter = self.isolated_linter.lock().await;
+            let diagnostics = isolated_linter.run_single(uri, content.clone());
+            if let Some(t0) = t0 {
+                debug!(
+                    "[profile] isolated run_single uri={:?} ms={}",
+                    uri,
+                    t0.elapsed().as_millis()
+                );
+            }
             self.diagnostics.isolated_linter.pin().insert(uri.to_string(), diagnostics);
         }
 
-        if tsgolint && let Some(tsgo_linter) = self.tsgo_linter.as_ref() {
-            self.diagnostics
-                .tsgo_linter
-                .pin()
-                .insert(uri.to_string(), tsgo_linter.lint_file(uri, content.clone()));
+        // Suppress per-file tsgo linting when workspace_mode is active; rely on batch results.
+        if tsgolint {
+            if !self.workspace_mode {
+                if let Some(tsgo_linter) = self.tsgo_linter.as_ref() {
+                    let t0 = Some(Instant::now());
+                    let res = tsgo_linter.lint_file(uri, content.clone());
+                    info!(
+                        "[tsgo] single run uri={} diagnostics={}",
+                        uri.as_str(),
+                        res.as_ref().map(|v| v.len()).unwrap_or(0)
+                    );
+                    if let Some(t0) = t0 {
+                        debug!(
+                            "[profile] tsgo single uri={:?} ms={} diagnostics={}",
+                            uri,
+                            t0.elapsed().as_millis(),
+                            res.as_ref().map(|v| v.len()).unwrap_or(0)
+                        );
+                    }
+                    self.diagnostics.tsgo_linter.pin().insert(uri.to_string(), res);
+                }
+            } else {
+                debug!("[tsgo] single suppressed (workspace_mode) uri={}", uri.as_str());
+            }
         }
 
         self.diagnostics.get_diagnostics(&uri.to_string())
+    }
+
+    /// Cache isolated (oxlint) diagnostics for a file.
+    pub fn cache_isolated_diagnostics(
+        &self,
+        uri: &Uri,
+        diagnostics: Option<Vec<DiagnosticReport>>,
+    ) {
+        self.diagnostics.isolated_linter.pin().insert(uri.to_string(), diagnostics);
+    }
+
+    /// Cache tsgo (type-aware) diagnostics for a file.
+    pub fn cache_tsgo_diagnostics(&self, uri: &Uri, diagnostics: Option<Vec<DiagnosticReport>>) {
+        self.diagnostics.tsgo_linter.pin().insert(uri.to_string(), diagnostics);
+    }
+
+    /// Batch run isolated linter across multiple paths using parallel runtime.
+    /// Does not include tsgo/type-aware diagnostics (falls back to sequential path when needed).
+    pub async fn run_workspace_isolated(
+        &self,
+        paths: &[PathBuf],
+    ) -> Vec<(Uri, Vec<DiagnosticReport>)> {
+        use tokio::sync::MutexGuard;
+
+        let t0 = Instant::now();
+        let mut handler: MutexGuard<'_, IsolatedLintHandler> = self.isolated_linter.lock().await;
+        let out = handler.run_workspace(paths);
+        debug!("[profile] isolated batch files={} ms={}", paths.len(), t0.elapsed().as_millis());
+        out
     }
 
     pub fn needs_restart(old_options: &LSPLintOptions, new_options: &LSPLintOptions) -> bool {
         old_options.config_path != new_options.config_path
             || old_options.ts_config_path != new_options.ts_config_path
             || old_options.use_nested_configs() != new_options.use_nested_configs()
-            || old_options.fix_kind() != new_options.fix_kind()
+            || old_options.fix_kind != new_options.fix_kind
             || old_options.unused_disable_directives != new_options.unused_disable_directives
             // TODO: only the TsgoLinter needs to be dropped or created
             || old_options.type_aware != new_options.type_aware
+            // workspace-wide linting mode impacts watcher setup and cached diagnostics strategy
+            || old_options.workspace_mode != new_options.workspace_mode
     }
 
     pub fn get_watch_patterns(&self, options: &LSPLintOptions, root_path: &Path) -> Vec<Pattern> {
@@ -421,22 +563,18 @@ mod test {
         ConcurrentHashMap,
         linter::{
             error_with_position::DiagnosticReport,
-            options::{LintOptions, Run, UnusedDisableDirectives},
+            options::{LintFixKindFlag, LintOptions, Run, UnusedDisableDirectives},
             server_linter::{ServerLinter, ServerLinterDiagnostics},
         },
         tester::{Tester, get_file_path},
     };
-    use rustc_hash::FxHashMap;
 
     #[test]
     fn test_create_nested_configs_with_disabled_nested_configs() {
-        let mut flags = FxHashMap::default();
-        flags.insert("disable_nested_configs".to_string(), "true".to_string());
-
         let mut nested_ignore_patterns = Vec::new();
         let (configs, _) = ServerLinter::create_nested_configs(
             Path::new("/root/"),
-            &LintOptions { flags, ..LintOptions::default() },
+            &LintOptions { disable_nested_config: true, ..LintOptions::default() },
             &mut nested_ignore_patterns,
         );
 
@@ -620,10 +758,7 @@ mod test {
         Tester::new(
             "fixtures/linter/multiple_suggestions",
             Some(LintOptions {
-                flags: FxHashMap::from_iter([(
-                    "fix_kind".to_string(),
-                    "safe_fix_or_suggestion".to_string(),
-                )]),
+                fix_kind: LintFixKindFlag::SafeFixOrSuggestion,
                 ..Default::default()
             }),
         )

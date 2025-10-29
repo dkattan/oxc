@@ -3,13 +3,25 @@ use tower_lsp_server::lsp_types::Uri;
 
 use crate::{formatter::options::FormatOptions, linter::options::LintOptions};
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Options {
     #[serde(flatten)]
     pub lint: LintOptions,
     #[serde(flatten)]
     pub format: FormatOptions,
+    #[serde(default)]
+    pub supported_extensions: Vec<String>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            lint: LintOptions::default(),
+            format: FormatOptions::default(),
+            supported_extensions: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -23,7 +35,7 @@ pub struct WorkspaceOption {
 mod test {
     use serde_json::json;
 
-    use crate::linter::options::Run;
+    use crate::linter::options::{LintFixKindFlag, Run};
 
     use super::WorkspaceOption;
 
@@ -46,7 +58,11 @@ mod test {
         let options = &workspace[0].options;
         assert_eq!(options.lint.run, Run::OnType); // fallback
         assert_eq!(options.lint.config_path, Some("./custom.json".into()));
-        assert!(options.lint.flags.is_empty());
+        assert_eq!(options.lint.ts_config_path, None);
+        assert!(!options.lint.type_aware);
+        assert!(!options.lint.disable_nested_config);
+        assert_eq!(options.lint.fix_kind, LintFixKindFlag::SafeFix);
         assert!(options.format.experimental);
+        assert_eq!(options.format.config_path, None);
     }
 }
